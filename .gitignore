@@ -1,0 +1,19 @@
+# Logs
+*.log
+*.dat
+/tmp/
+
+# Sensitive files
+*.key
+*.pem
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
