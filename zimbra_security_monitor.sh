@@ -1,7 +1,8 @@
 #!/bin/bash
 ################################################################################
 # Zimbra Security Monitor (Server-Side)
-# Purpose: Monitor failed login attempts and send alerts to Telegram (Summary Mode)
+# Purpose: Monitor failed login attempts and send alerts to Telegram
+# Features: Top 20 Limit, Pattern Detection (SSH/Web), Smart Block Command, Local User Filter
 # Author: IT Team PT MJL
 # Location: /opt/zimbra/scripts/zimbra_security_monitor.sh
 ################################################################################
@@ -30,6 +31,7 @@ WHITELIST_IPS="127.0.0.1 192.168.4.5 192.168.4.1" # Local/Trusted IPs
 # ==================== FUNCTIONS ====================
 
 log() {
+    # Consistent Log Format: [Mon DD YYYY - HH:MM:SS] [CATEGORY] Message
     local timestamp=$(date '+%b %d %Y - %H:%M:%S')
     echo "[${timestamp}] [SECURITY] $1" | tee -a "${SCRIPT_LOG}"
 }
@@ -58,12 +60,33 @@ get_ip_location_short() {
     fi
 }
 
+get_attack_pattern() {
+    local ip=$1
+    # Check SSH (Secure/Auth Log)
+    local ssh_user=$(grep "$ip" /var/log/secure /var/log/auth.log 2>/dev/null | grep "Failed password" | tail -1 | sed -n 's/.*for \(invalid user \)\?\([^ ]*\) from.*/\2/p')
+    
+    if [ -n "$ssh_user" ]; then
+        echo "SSH:${ssh_user}"
+        return
+    fi
+    
+    # Check Zimbra (Mailbox Log)
+    local zim_user=$(grep "$ip" /opt/zimbra/log/mailbox.log 2>/dev/null | grep "authentication failed" | tail -1 | grep -oP 'authentication failed for \[\K[^\]]+')
+    
+    if [ -n "$zim_user" ]; then
+        # Take username only (remove @domain) to save space
+        local short_user=$(echo "$zim_user" | cut -d'@' -f1)
+        echo "WEB:${short_user}"
+        return
+    fi
+    
+    echo "UNK:N/A"
+}
+
 get_last_attack_time() {
     local ip=$1
-    # Check secure/auth log first for latest timestamp
     local last_time=$(grep "$ip" /var/log/secure /var/log/auth.log 2>/dev/null | grep "Failed" | tail -1 | awk '{print $3}')
     if [ -z "$last_time" ]; then
-        # If not found, check zimbra mailbox.log (timestamp format is different, e.g., 2026-01-22 09:30:00)
         last_time=$(grep "$ip" /opt/zimbra/log/mailbox.log 2>/dev/null | grep "authentication failed" | tail -1 | awk '{print $2}' | cut -d',' -f1)
     fi
     echo "${last_time:-N/A}"
@@ -108,44 +131,50 @@ check_failed_logins() {
         return 0
     fi
     
-    # 2. Process IPs (Filter Blocked ones first)
+    # 2. Process IPs
     local summary_report=""
     local alert_count=0
     local block_list_cmd=""
     
-    # Read line by line
     while read count ip; do
         if [ -z "$ip" ] || [ "$ip" = "from" ]; then continue; fi
         if [ "$count" -lt "$FAILED_THRESHOLD" ]; then continue; fi
         
-        # Stop processing if we reached 20 alerts to keep message short
+        # Stop processing if we reached 20 alerts
         if [ "$alert_count" -ge 20 ]; then break; fi
 
         # Whitelist Check
         if [[ " ${WHITELIST_IPS} " =~ " ${ip} " ]]; then
-            log "SKIP: IP $ip is Whitelisted."
+            log "[SKIP] Whitelisted Trusted IP: $ip"
             continue
         fi
 
-        # Smart Filter: Check IPTables
+        # Filter Blocked IPs
         if is_ip_blocked "$ip"; then
-            # Silent skip, do not log to keep logs clean
             continue
         fi
 
-        log "Found NEW threat: $ip ($count attempts)"
+        # Gather Information Needed for Logic
+        local country=$(get_ip_location_short "$ip")
+        local pattern=$(get_attack_pattern "$ip")
+        local last_time=$(get_last_attack_time "$ip")
+
+        # --- SMART FILTER: Skipping Indonesian Web Users (Likely Employee Error) ---
+        if [[ "$country" == "Indonesia" ]] && [[ "$pattern" == WEB:* ]]; then
+            log "[USER_ERROR] $ip (Indonesia) | Count: $count | $pattern | Action: Logged Only (Skipping Alert)"
+            continue
+        fi
+
+        # Otherwise: Treat as Threat
+        log "[THREAT] $ip ($country) | Count: $count | $pattern | Action: Added to Report"
 
         # Increase Alert Count
         alert_count=$((alert_count + 1))
         
-        # Gather details
-        local country=$(get_ip_location_short "$ip")
-        local last_time=$(get_last_attack_time "$ip")
-        
         # Add to Report
         summary_report="${summary_report}
 👉 <b>${ip}</b> (${country})
-   Qt: <b>${count}x</b> | Time: ${last_time}"
+   Qt: <b>${count}x</b> | Time: ${last_time} | 🎯 <b>${pattern}</b>"
 
         # Add to block command list
         block_list_cmd="${block_list_cmd}${ip},"
@@ -153,7 +182,6 @@ check_failed_logins() {
 
     # 3. Send Telegram if there are NEW threats
     if [ "$alert_count" -gt 0 ]; then
-        # Clean up comma
         block_list_cmd=${block_list_cmd%,}
         
         local header="🚨 <b>Zimbra Security Summary</b>
@@ -166,9 +194,9 @@ To block all these IPs at once, run:
 <code>iptables -I INPUT -s ${block_list_cmd} -j DROP</code>"
 
         send_telegram "${header}${summary_report}${footer}"
-        log "Sent summary report for ${alert_count} new IPs."
+        log "[ALERT] Sent summary report for ${alert_count} new IPs."
     else
-        log "All detected IPs are already blocked or below threshold."
+        log "[INFO] No actionable threats found (Local errors filtered or already blocked)."
     fi
 }
 
