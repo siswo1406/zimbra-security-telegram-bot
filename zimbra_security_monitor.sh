@@ -94,7 +94,8 @@ get_last_attack_time() {
 
 is_ip_blocked() {
     local ip=$1
-    if iptables -vnL INPUT 2>/dev/null | grep -q "$ip"; then
+    # Use iptables -S for exact rule matching (more reliable than vnL)
+    if iptables -S INPUT 2>/dev/null | grep -qE "\-s ${ip}(/32)? \-j DROP"; then
         return 0 # True, blocked
     else
         return 1 # False, not blocked
